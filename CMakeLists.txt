@@ -22,12 +22,26 @@ set(CMAKE_AUTOUIC ON)
 
 # Include directories
 include_directories(include)
+include_directories(/home/imanoob/ros2_jazzy/src/stm32_mavlink_interface/include/mavlink/c_library_v2)
+include_directories(/home/imanoob/ros2_jazzy/src/stm32_mavlink_interface/include/mavlink/c_library_v2/common)
+
+# Generate MOC files explicitly
+qt5_wrap_cpp(MOC_FILES
+  include/mavlink_gui_tester/mavlink_gui_widget.hpp
+)
 
 # Create executable
 add_executable(mavlink_gui_tester_node
   src/main.cpp
   src/mavlink_gui_widget.cpp
-  src/moc_mavlink_gui_widget.cpp
+  src/line_graph_widget.cpp
+  ${MOC_FILES}
+)
+
+# Link Qt5 libraries before ament dependencies
+target_link_libraries(mavlink_gui_tester_node
+  Qt5::Core
+  Qt5::Widgets
 )
 
 # Specify libraries to link a library or executable target against
@@ -40,11 +54,6 @@ ament_target_dependencies(mavlink_gui_tester_node
   rclcpp_components
 )
 
-# Link Qt5 libraries
-target_link_libraries(mavlink_gui_tester_node
-  Qt5::Core
-  Qt5::Widgets
-)
 
 # Install targets
 install(TARGETS

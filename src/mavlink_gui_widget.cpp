@@ -2,6 +2,7 @@
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QMessageBox>
 #include <QtCore/QDebug>
+#include <QtCore/QDateTime>
 #include <chrono>
 #include <cstring>
 #include <algorithm>
@@ -21,7 +22,12 @@ MAVLinkGUIWidget::MAVLinkGUIWidget(std::shared_ptr<rclcpp::Node> node, QWidget *
       component_id_(1),
       target_system_id_(1),
       target_component_id_(1),
-      message_count_(0) {
+      message_count_(0),
+      robomaster_reading_(false),
+      selected_motor_(-1) {
+
+    // Initialize robomaster motor data map
+    motor_data_map_.clear();
     
     setupUI();
     
@@ -30,6 +36,10 @@ MAVLinkGUIWidget::MAVLinkGUIWidget(std::shared_ptr<rclcpp::Node> node, QWidget *
     connect(update_timer_, &QTimer::timeout, this, &MAVLinkGUIWidget::updateReceivedMessages);
     connect(update_timer_, &QTimer::timeout, this, &MAVLinkGUIWidget::updateConnectionStatus);
     update_timer_->start(100); // Update every 100ms
+
+    // Initialize robomaster update timer
+    robomaster_update_timer_ = new QTimer(this);
+    connect(robomaster_update_timer_, &QTimer::timeout, this, &MAVLinkGUIWidget::updateRobomasterGraph);
     
     // Get parameters from ROS node if available
     if (node_) {
@@ -90,6 +100,7 @@ void MAVLinkGUIWidget::setupUI() {
     setupServoOutputTab();
     setupAttitudeTab();
     setupCustomHexTab();
+    setupRobomasterStateTab();
     
     // Setup received messages area
     setupReceivedMessagesArea();
@@ -507,6 +518,85 @@ void MAVLinkGUIWidget::setupCustomHexTab() {
     layout->addStretch();
 }
 
+void MAVLinkGUIWidget::setupRobomasterStateTab() {
+    robomaster_state_tab_ = new QWidget();
+    main_tabs_->addTab(robomaster_state_tab_, "ReadRobomasterState");
+
+    QVBoxLayout* layout = new QVBoxLayout(robomaster_state_tab_);
+
+    // Motor selection group
+    QGroupBox* motor_group = new QGroupBox("Motor Selection");
+    QHBoxLayout* motor_layout = new QHBoxLayout(motor_group);
+
+    motor_layout->addWidget(new QLabel("Select Motor:"));
+    motor_combo_ = new QComboBox();
+    motor_combo_->addItem("None", -1);
+    for (int i = 1; i <= 8; ++i) {
+        motor_combo_->addItem(QString("Motor %1").arg(i), i);
+    }
+    connect(motor_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MAVLinkGUIWidget::onMotorSelectionChanged);
+    motor_layout->addWidget(motor_combo_);
+    motor_layout->addStretch();
+
+    layout->addWidget(motor_group);
+
+    // State selection group
+    QGroupBox* state_group = new QGroupBox("State Selection");
+    QGridLayout* state_layout = new QGridLayout(state_group);
+
+    target_angle_check_ = new QCheckBox("Target Angle");
+    target_angle_check_->setChecked(true); // Default to checked
+    connect(target_angle_check_, &QCheckBox::toggled, this, &MAVLinkGUIWidget::onStateSelectionChanged);
+    state_layout->addWidget(target_angle_check_, 0, 0);
+
+    current_angle_check_ = new QCheckBox("Current Angle");
+    current_angle_check_->setChecked(true); // Default to checked
+    connect(current_angle_check_, &QCheckBox::toggled, this, &MAVLinkGUIWidget::onStateSelectionChanged);
+    state_layout->addWidget(current_angle_check_, 0, 1);
+
+    velocity_check_ = new QCheckBox("Velocity");
+    connect(velocity_check_, &QCheckBox::toggled, this, &MAVLinkGUIWidget::onStateSelectionChanged);
+    state_layout->addWidget(velocity_check_, 1, 0);
+
+    current_check_ = new QCheckBox("Current");
+    connect(current_check_, &QCheckBox::toggled, this, &MAVLinkGUIWidget::onStateSelectionChanged);
+    state_layout->addWidget(current_check_, 1, 1);
+
+    layout->addWidget(state_group);
+
+    // Control buttons
+    QHBoxLayout* button_layout = new QHBoxLayout();
+    start_read_btn_ = new QPushButton("Start Reading");
+    stop_read_btn_ = new QPushButton("Stop Reading");
+    clear_data_btn_ = new QPushButton("Clear Data");
+    stop_read_btn_->setEnabled(false);
+
+    connect(start_read_btn_, &QPushButton::clicked, this, &MAVLinkGUIWidget::onStartRobomasterRead);
+    connect(stop_read_btn_, &QPushButton::clicked, this, &MAVLinkGUIWidget::onStopRobomasterRead);
+    connect(clear_data_btn_, &QPushButton::clicked, this, &MAVLinkGUIWidget::onClearRobomasterData);
+
+    button_layout->addWidget(start_read_btn_);
+    button_layout->addWidget(stop_read_btn_);
+    button_layout->addWidget(clear_data_btn_);
+    button_layout->addStretch();
+
+    layout->addLayout(button_layout);
+
+    // Line graph widget
+    robomaster_graph_ = new LineGraphWidget();
+    robomaster_graph_->setMaxPoints(100);
+    layout->addWidget(robomaster_graph_, 3);
+
+    // Log area for showing reading status
+    robomaster_log_ = new QTextBrowser();
+    robomaster_log_->setMaximumHeight(80);
+    robomaster_log_->setFont(QFont("Courier", 9));
+    layout->addWidget(robomaster_log_, 1);
+
+    // Initialize motor selection
+    onMotorSelectionChanged();
+}
+
 void MAVLinkGUIWidget::setupReceivedMessagesArea() {
     received_messages_text_ = new QTextEdit();
     received_messages_text_->setReadOnly(true);
@@ -729,6 +819,162 @@ void MAVLinkGUIWidget::onClearMessages() {
     message_count_ = 0;
 }
 
+void MAVLinkGUIWidget::onStartRobomasterRead() {
+    if (selected_motor_ == -1) {
+        QMessageBox::warning(this, "Warning", "Please select a motor");
+        return;
+    }
+
+    if (!target_angle_check_->isChecked() && !current_angle_check_->isChecked() &&
+        !velocity_check_->isChecked() && !current_check_->isChecked()) {
+        QMessageBox::warning(this, "Warning", "Please select at least one state to monitor");
+        return;
+    }
+
+    robomaster_reading_ = true;
+    start_read_btn_->setEnabled(false);
+    stop_read_btn_->setEnabled(true);
+
+    // Clear existing data
+    motor_data_.clear();
+    robomaster_graph_->clearAll();
+
+    // Start the update timer
+    robomaster_update_timer_->start(100); // Update every 100ms
+
+    robomaster_log_->append(QString("Started reading Motor %1 states...").arg(selected_motor_));
+
+    if (node_) {
+        RCLCPP_INFO(node_->get_logger(), "Started Robomaster state reading for Motor %d", selected_motor_);
+    }
+}
+
+void MAVLinkGUIWidget::onStopRobomasterRead() {
+    robomaster_reading_ = false;
+    start_read_btn_->setEnabled(true);
+    stop_read_btn_->setEnabled(false);
+
+    robomaster_update_timer_->stop();
+
+    robomaster_log_->append("Stopped reading Robomaster states.");
+
+    if (node_) {
+        RCLCPP_INFO(node_->get_logger(), "Stopped Robomaster state reading");
+    }
+}
+
+void MAVLinkGUIWidget::onClearRobomasterData() {
+    // Clear motor data
+    motor_data_.clear();
+
+    // Clear the graph
+    robomaster_graph_->clearAll();
+
+    // Clear the log
+    robomaster_log_->clear();
+
+    robomaster_log_->append("Data cleared.");
+}
+
+void MAVLinkGUIWidget::onMotorSelectionChanged() {
+    selected_motor_ = motor_combo_->currentData().toInt();
+
+    // Clear data when motor selection changes
+    motor_data_.clear();
+    robomaster_graph_->clearAll();
+
+    QString selected_text = "Selected motor: ";
+    if (selected_motor_ == -1) {
+        selected_text += "None";
+    } else {
+        selected_text += QString("Motor %1").arg(selected_motor_);
+    }
+    robomaster_log_->append(selected_text);
+
+    onStateSelectionChanged();
+}
+
+void MAVLinkGUIWidget::onStateSelectionChanged() {
+    QString states_text = "Selected states: ";
+    QStringList selected_states;
+
+    if (target_angle_check_->isChecked()) selected_states << "Target Angle";
+    if (current_angle_check_->isChecked()) selected_states << "Current Angle";
+    if (velocity_check_->isChecked()) selected_states << "Velocity";
+    if (current_check_->isChecked()) selected_states << "Current";
+
+    if (selected_states.isEmpty()) {
+        states_text += "None";
+    } else {
+        states_text += selected_states.join(", ");
+    }
+
+    // Update graph series visibility
+    robomaster_graph_->setSeriesVisible("Target Angle", target_angle_check_->isChecked());
+    robomaster_graph_->setSeriesVisible("Current Angle", current_angle_check_->isChecked());
+    robomaster_graph_->setSeriesVisible("Velocity", velocity_check_->isChecked());
+    robomaster_graph_->setSeriesVisible("Current", current_check_->isChecked());
+
+    robomaster_log_->append(states_text);
+}
+
+void MAVLinkGUIWidget::updateRobomasterGraph() {
+    if (!robomaster_reading_ || selected_motor_ == -1) {
+        return;
+    }
+
+    // Convert selected_motor_ from index (0-3) to motor_id (1-4)
+    uint8_t motor_id = static_cast<uint8_t>(selected_motor_ + 1);
+
+    // Check if we have valid data for the selected motor
+    auto it = motor_data_map_.find(motor_id);
+    if (it == motor_data_map_.end() || !it->second.valid) {
+        return;
+    }
+
+    const SingleMotorData& motor_data = it->second;
+
+    QDateTime now = QDateTime::currentDateTime();
+    qint64 timestamp = now.toMSecsSinceEpoch();
+
+    // Extract data from the motor data structure
+    // Convert radians to degrees for angle display
+    double target_angle = motor_data.target_position_rad * 180.0 / M_PI;
+    double current_angle = motor_data.current_position_rad * 180.0 / M_PI;
+    double velocity = motor_data.current_velocity_rps; // RPS (rotations per second)
+    double current_val = motor_data.current_milliamps / 1000.0; // Convert to amps
+
+    // Store the data in the legacy structure for graph history
+    MotorState state;
+    state.target_angle = target_angle;
+    state.current_angle = current_angle;
+    state.velocity = velocity;
+    state.current = current_val;
+    state.timestamp = now;
+    motor_data_.push_back(state);
+
+    // Keep only last 100 entries
+    if (motor_data_.size() > 100) {
+        motor_data_.erase(motor_data_.begin());
+    }
+
+    // Add data points to the graph
+    double time_value = timestamp / 1000.0; // Convert to seconds for better x-axis display
+
+    if (target_angle_check_->isChecked()) {
+        robomaster_graph_->addDataPoint("Target Angle", time_value, target_angle);
+    }
+    if (current_angle_check_->isChecked()) {
+        robomaster_graph_->addDataPoint("Current Angle", time_value, current_angle);
+    }
+    if (velocity_check_->isChecked()) {
+        robomaster_graph_->addDataPoint("Velocity", time_value, velocity);
+    }
+    if (current_check_->isChecked()) {
+        robomaster_graph_->addDataPoint("Current", time_value, current_val);
+    }
+}
+
 void MAVLinkGUIWidget::updateReceivedMessages() {
     std::lock_guard<std::mutex> lock(rx_queue_mutex_);
     
@@ -884,17 +1130,121 @@ void MAVLinkGUIWidget::sendMAVLinkMessage(uint8_t msg_id, const std::vector<uint
 
 void MAVLinkGUIWidget::parseReceivedData(const std::vector<uint8_t>& data) {
     std::lock_guard<std::mutex> lock(rx_queue_mutex_);
-    
+
     std::string hex_data = bytesToHex(data);
     auto now = std::chrono::steady_clock::now();
     auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    
+
     rx_messages_.push("[" + std::to_string(timestamp) + "] RX: " + hex_data);
-    
+
     // Keep only last 100 messages
     while (rx_messages_.size() > 100) {
         rx_messages_.pop();
     }
+
+    // Parse MAVLink messages
+    mavlink_message_t msg;
+    mavlink_status_t status;
+
+    for (uint8_t byte : data) {
+        if (mavlink_parse_char(MAVLINK_COMM_0, byte, &msg, &status)) {
+            parseMAVLinkMessage(msg);
+        }
+    }
+}
+
+void MAVLinkGUIWidget::parseMAVLinkMessage(const mavlink_message_t& msg) {
+    switch (msg.msgid) {
+        case 181: // MAVLINK_MSG_ID_ROBOMASTER_MOTOR_STATUS
+            handleRobomasterMotorStatus(msg);
+            break;
+        default:
+            // Handle other message types if needed
+            break;
+    }
+}
+
+void MAVLinkGUIWidget::handleRobomasterMotorStatus(const mavlink_message_t& msg) {
+    // Parse the payload according to the sender format:
+    // motor_id (1 byte)
+    // current_position_rad (4 bytes float)
+    // current_velocity_rps (4 bytes float)
+    // current_milliamps (2 bytes int16_t)
+    // temperature_celsius (1 byte)
+    // target_position_rad (4 bytes float)
+    // target_velocity_rps (4 bytes float)
+    // target_current (2 bytes int16_t)
+    // control_mode (1 byte)
+    // enabled (1 byte)
+    // status (1 byte)
+    // error_count (2 bytes uint16_t)
+    // timeout_count (2 bytes uint16_t)
+    // overheat_count (2 bytes uint16_t)
+    // last_command_age_ms (4 bytes uint32_t)
+    // last_feedback_age_ms (4 bytes uint32_t)
+
+    if (msg.len < 35) { // Minimum expected payload size
+        return;
+    }
+
+    const uint8_t* payload = reinterpret_cast<const uint8_t*>(msg.payload64);
+    uint16_t offset = 0;
+
+    SingleMotorData motor_data;
+
+    // Parse motor ID
+    motor_data.motor_id = payload[offset++];
+
+    // Parse current measurements
+    memcpy(&motor_data.current_position_rad, &payload[offset], sizeof(float));
+    offset += sizeof(float);
+
+    memcpy(&motor_data.current_velocity_rps, &payload[offset], sizeof(float));
+    offset += sizeof(float);
+
+    memcpy(&motor_data.current_milliamps, &payload[offset], sizeof(int16_t));
+    offset += sizeof(int16_t);
+
+    motor_data.temperature_celsius = payload[offset++];
+
+    // Parse target values
+    memcpy(&motor_data.target_position_rad, &payload[offset], sizeof(float));
+    offset += sizeof(float);
+
+    memcpy(&motor_data.target_velocity_rps, &payload[offset], sizeof(float));
+    offset += sizeof(float);
+
+    memcpy(&motor_data.target_current, &payload[offset], sizeof(int16_t));
+    offset += sizeof(int16_t);
+
+    // Parse status flags
+    motor_data.control_mode = payload[offset++];
+    motor_data.enabled = (payload[offset++] != 0);
+    motor_data.status = payload[offset++];
+
+    // Parse statistics
+    memcpy(&motor_data.error_count, &payload[offset], sizeof(uint16_t));
+    offset += sizeof(uint16_t);
+
+    memcpy(&motor_data.timeout_count, &payload[offset], sizeof(uint16_t));
+    offset += sizeof(uint16_t);
+
+    memcpy(&motor_data.overheat_count, &payload[offset], sizeof(uint16_t));
+    offset += sizeof(uint16_t);
+
+    // Parse timestamps
+    memcpy(&motor_data.last_command_age_ms, &payload[offset], sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    memcpy(&motor_data.last_feedback_age_ms, &payload[offset], sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    // Mark as valid and set received time
+    motor_data.valid = true;
+    motor_data.received_time = QDateTime::currentDateTime();
+
+    // Store in map indexed by motor_id
+    motor_data_map_[motor_data.motor_id] = motor_data;
 }
 
 std::string MAVLinkGUIWidget::bytesToHex(const std::vector<uint8_t>& bytes) {

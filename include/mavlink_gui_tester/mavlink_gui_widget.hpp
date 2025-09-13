@@ -20,17 +20,30 @@
 #include <QtWidgets/QScrollArea>
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QProgressBar>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QTableWidget>
+#include <QtWidgets/QTextBrowser>
 #include <QtCore/QTimer>
+#include <QtCore/QDateTime>
+#include <QtGui/QPainter>
+#include <QtGui/QPen>
+#include <QtCore/QPointF>
 #include <rclcpp/rclcpp.hpp>
+#include "line_graph_widget.hpp"
 #include <std_msgs/msg/string.hpp>
 #include <memory>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include <queue>
+#include <map>
+#include <cmath>
 #include <termios.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <mavlink.h>
+
+#define MAVLINK_MSG_ID_ROBOMASTER_MOTOR_STATUS 181
 
 namespace mavlink_gui_tester {
 
@@ -54,6 +67,12 @@ private slots:
     void onClearMessages();
     void updateReceivedMessages();
     void updateConnectionStatus();
+    void onStartRobomasterRead();
+    void onStopRobomasterRead();
+    void onClearRobomasterData();
+    void onMotorSelectionChanged();
+    void onStateSelectionChanged();
+    void updateRobomasterGraph();
 
 private:
     void setupUI();
@@ -65,6 +84,7 @@ private:
     void setupServoOutputTab();
     void setupAttitudeTab();
     void setupCustomHexTab();
+    void setupRobomasterStateTab();
     void setupReceivedMessagesArea();
     
     bool openSerialPort();
@@ -73,6 +93,8 @@ private:
     void rxThread();
     void sendMAVLinkMessage(uint8_t msg_id, const std::vector<uint8_t>& payload);
     void parseReceivedData(const std::vector<uint8_t>& data);
+    void parseMAVLinkMessage(const mavlink_message_t& msg);
+    void handleRobomasterMotorStatus(const mavlink_message_t& msg);
     std::string bytesToHex(const std::vector<uint8_t>& bytes);
     std::vector<uint8_t> hexToBytes(const std::string& hex);
     
@@ -152,16 +174,74 @@ private:
     QWidget* custom_hex_tab_;
     QTextEdit* hex_input_edit_;
     QPushButton* send_hex_btn_;
-    
+
+    // Robomaster State tab
+    QWidget* robomaster_state_tab_;
+    LineGraphWidget* robomaster_graph_;
+    QTextBrowser* robomaster_log_;
+    QComboBox* motor_combo_;
+    QCheckBox* target_angle_check_;
+    QCheckBox* current_angle_check_;
+    QCheckBox* velocity_check_;
+    QCheckBox* current_check_;
+    QPushButton* start_read_btn_;
+    QPushButton* stop_read_btn_;
+    QPushButton* clear_data_btn_;
+    QTimer* robomaster_update_timer_;
+    struct MotorState {
+        double target_angle;
+        double current_angle;
+        double velocity;
+        double current;
+        QDateTime timestamp;
+    };
+    std::vector<MotorState> motor_data_;
+
+    // Store latest robomaster motor status message per motor
+    struct SingleMotorData {
+        uint8_t motor_id;
+
+        // Current measurements
+        float current_position_rad;
+        float current_velocity_rps;
+        int16_t current_milliamps;
+        uint8_t temperature_celsius;
+
+        // Target values
+        float target_position_rad;
+        float target_velocity_rps;
+        int16_t target_current;
+
+        // Status flags
+        uint8_t control_mode;
+        bool enabled;
+        uint8_t status;
+
+        // Statistics
+        uint16_t error_count;
+        uint16_t timeout_count;
+        uint16_t overheat_count;
+
+        // Timestamps
+        uint32_t last_command_age_ms;
+        uint32_t last_feedback_age_ms;
+
+        bool valid;
+        QDateTime received_time;
+    };
+
+    // Store data for up to 4 motors (indexed by motor_id)
+    std::map<uint8_t, SingleMotorData> motor_data_map_;
+
     // Received messages area
     QTextEdit* received_messages_text_;
     QTimer* update_timer_;
-    
+
     // Status bar
     QStatusBar* status_bar_;
     QLabel* status_label_;
     QLabel* message_count_label_;
-    
+
     // Configuration
     std::string serial_port_;
     int baudrate_;
@@ -169,8 +249,11 @@ private:
     uint8_t component_id_;
     uint8_t target_system_id_;
     uint8_t target_component_id_;
-    
+
     int message_count_;
+    bool robomaster_reading_;
+    int selected_motor_;
+
 };
 
 } // namespace mavlink_gui_tester
